@@ -6,7 +6,21 @@
     modal = $("#modal-body"),
     native = window.FeltNative;
   const engine = window.PokerEngine;
+  const vision = window.BoardVision;
   const inboxId = engine.inboxId;
+  // Photos are compressed on this device and kept beside the book, never sent anywhere.
+  const PHOTO = Object.freeze({
+    side: 1600, // longest edge of the stored copy
+    thumb: 360,
+    quality: 0.8,
+    maxBytes: 2 * 1024 * 1024, // per stored photo
+    maxInput: 40 * 1024 * 1024, // per picked file
+    maxPixels: 80e6,
+  });
+  const MAX_BACKUP_BYTES = 300 * 1024 * 1024;
+  const photoKey = (id) => "photo:" + id;
+  const photoIdPattern = /^[A-Za-z0-9-]{8,80}$/;
+  const cardPattern = /^[2-9TJQKA][shdc]$/;
   const roster = (data = book) => data.players.filter((p) => p.id !== inboxId);
   const suits = { s: "♠", h: "♥", d: "♦", c: "♣" },
     suitNames = { s: "黑桃", h: "红桃", d: "方块", c: "梅花" };
@@ -34,6 +48,7 @@
     cards: "M9 3h10v16H9z M6 6l-3 1 3 14 7-2",
     trash: "M3 6h18 M9 6V3h6v3 M6 6l1 14h10l1-14",
     note: "M4 4h16v12l-4 4H4z M8 9h8 M8 13h5",
+    camera: "M4 8h3l2-3h6l2 3h3v11H4z M15.5 13a3.5 3.5 0 1 1-7 0 3.5 3.5 0 0 1 7 0",
   };
   const icon = (k) =>
     `<svg class="ic" aria-hidden="true" viewBox="0 0 24 24"><path d="${glyphs[k] || glyphs.note}"/></svg>`;
@@ -94,7 +109,15 @@
   let pendingImport = null,
     newTags = new Set(),
     draftCards = null,
-    cardPicker = null;
+    cardPicker = null,
+    editorGroups = null, // limit the card editor to some groups (board-only sheet)
+    dropPhoto = false, // edit sheet: remove the note's photo on save
+    fullPhotoUrl = null;
+  // Photo records: { id, type, width, height, size, at, draft, bytes, thumb }.
+  const memPhotos = new Map(); // records picked in this window (native drafts live only here)
+  const thumbUrls = new Map();
+  let recog = null, // board recognition for the current draft photo
+    photoBusy = false;
   const demo = {
     id: "felt-example",
     name: "蓝帽子（示例）",
@@ -183,6 +206,8 @@
             (!n.originPlayer || str(n.originPlayer, 150)),
           "备份中有一条记录格式不完整。",
         );
+        if (n.photo != null)
+          check(photoMetaOk(n.photo), "备份中有一条记录的照片信息无效。");
         ids.add(n.id);
         const all = [];
         for (const k of Object.keys(groups)) {
@@ -200,7 +225,27 @@
         check(new Set(all).size === all.length, "备份中的一手牌有重复牌。");
       }
     }
+    // Inline photos only exist in the native shell's book and in backups.
+    if (obj.photos != null) {
+      check(
+        typeof obj.photos === "object" && !Array.isArray(obj.photos) &&
+          Object.entries(obj.photos).every(([id, p]) => photoIdPattern.test(id) && inlineShapeOk(p)),
+        "备份中的照片区格式无效。",
+      );
+    }
     return obj;
+  }
+  const whole = (v, max) => Number.isInteger(v) && v >= 1 && v <= max;
+  function photoMetaOk(m) {
+    return !!m && typeof m === "object" && typeof m.id === "string" &&
+      photoIdPattern.test(m.id) && m.type === "image/jpeg" &&
+      whole(m.width, 4096) && whole(m.height, 4096) && whole(m.size, PHOTO.maxBytes);
+  }
+  // Cheap shape check; full byte and decode checks run when a backup is imported.
+  function inlineShapeOk(p) {
+    return !!p && typeof p === "object" && p.type === "image/jpeg" &&
+      whole(p.width, 4096) && whole(p.height, 4096) && typeof p.data === "string" &&
+      p.data.length <= Math.ceil((PHOTO.maxBytes * 4) / 3) + 4 && p.data.startsWith("/9j/");
   }
   function openDb() {
     return new Promise((resolve, reject) => {
@@ -210,7 +255,14 @@
       req.onerror = () => reject(req.error);
     });
   }
-  function readDb(mutate) {
+  function storageError(e) {
+    if (e?.name === "QuotaExceededError" || /quota|space|空间/i.test(e?.message || ""))
+      return Error("手机存储空间不足，这次没有保存。草稿还在；可以先保存完整备份、清理空间后再试。");
+    return e || Error("本机存档无法写入，请检查可用空间。");
+  }
+  // Photos share the "journal" store under "photo:<id>" keys, so the database
+  // version stays at 1 and an older cached copy of the app can still open it.
+  function readDb(mutate, photoOps) {
     return new Promise((resolve, reject) => {
       const tr = database.transaction(
           "journal",
@@ -226,6 +278,8 @@
             mutate(value);
             checkBook(value);
             store.put(value, "book");
+            for (const rec of photoOps?.save || [])
+              store.put({ ...rec, draft: false }, photoKey(rec.id));
           }
         } catch (e) {
           failure = e;
@@ -234,25 +288,281 @@
       };
       tr.oncomplete = () => resolve(value);
       tr.onerror = tr.onabort = () =>
-        reject(
-          failure || tr.error || Error("本机存档无法写入，请检查可用空间。"),
-        );
+        reject(failure || storageError(tr.error));
     });
   }
-  async function change(fn) {
+  // Runs `fn` against the book; `ops.save` lists photo records the result uses.
+  async function change(fn, ops = null) {
     if (!ready) throw Error("存档尚未打开。");
     if (native) {
       const next = nativeQueue.then(async () => {
         const data = JSON.parse(JSON.stringify(book));
         fn(data);
+        if (ops?.save?.length) {
+          data.photos = data.photos || {};
+          for (const rec of ops.save) data.photos[rec.id] = toInline(rec);
+        }
+        pruneInline(data);
         checkBook(data);
-        await native.save(JSON.stringify(data));
+        try {
+          await native.save(JSON.stringify(data));
+        } catch (e) {
+          throw storageError(e);
+        }
         book = data;
       });
       nativeQueue = next.catch(() => {});
       return next;
     }
-    book = await readDb(fn);
+    book = await readDb(fn, ops);
+  }
+  function photoIdsIn(data) {
+    const ids = new Set();
+    for (const p of data.players) for (const n of p.notes) if (n.photo?.id) ids.add(n.photo.id);
+    return ids;
+  }
+  function pruneInline(data) {
+    if (!data.photos) return;
+    const used = photoIdsIn(data);
+    for (const id of Object.keys(data.photos)) if (!used.has(id)) delete data.photos[id];
+    if (!Object.keys(data.photos).length) delete data.photos;
+  }
+  function idb(mode, fn) {
+    return new Promise((resolve, reject) => {
+      const tr = database.transaction("journal", mode);
+      const out = fn(tr.objectStore("journal"));
+      tr.oncomplete = () => resolve(out);
+      tr.onerror = tr.onabort = () => reject(storageError(tr.error));
+    });
+  }
+  // Deletes stored photos that no note and no saved draft points to. A draft
+  // photo from another window gets a day before it counts as abandoned.
+  async function sweepPhotos() {
+    if (native || !database) return;
+    const keep = new Set(availableDrafts().map((d) => d.value.photo?.id).filter(Boolean));
+    if (draft.photo) keep.add(draft.photo.id);
+    await idb("readwrite", (store) => {
+      const req = store.get("book");
+      req.onsuccess = () => {
+        for (const id of req.result ? photoIdsIn(req.result) : []) keep.add(id);
+        const keys = store.getAllKeys(IDBKeyRange.bound("photo:", "photo:￿"));
+        keys.onsuccess = () => {
+          for (const key of keys.result) {
+            if (keep.has(String(key).slice(6))) continue;
+            const got = store.get(key);
+            got.onsuccess = () => {
+              const rec = got.result;
+              if (!rec?.draft || !(Date.now() - Date.parse(rec.at) < 864e5)) store.delete(key);
+            };
+          }
+        };
+      };
+    });
+  }
+  const sweepLater = () => setTimeout(() => sweepPhotos().catch(() => {}), 500);
+
+  /* ---------- photo bytes ---------- */
+
+  function toBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let s = "";
+    for (let i = 0; i < bytes.length; i += 0x8000)
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+  function fromBase64(text) {
+    const s = atob(text);
+    const bytes = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+    return bytes.buffer;
+  }
+  const toInline = (r) => ({ type: "image/jpeg", width: r.width, height: r.height, data: toBase64(r.bytes) });
+  function fromInline(id, p) {
+    const bytes = fromBase64(p.data);
+    return { id, type: "image/jpeg", width: p.width, height: p.height, size: bytes.byteLength, bytes, thumb: null };
+  }
+  const blobOf = (rec, thumb) => new Blob([thumb && rec.thumb ? rec.thumb : rec.bytes], { type: "image/jpeg" });
+  async function loadPhotos(ids) {
+    const out = new Map(), rest = [];
+    for (const id of ids) memPhotos.has(id) ? out.set(id, memPhotos.get(id)) : rest.push(id);
+    if (!rest.length) return out;
+    if (native) {
+      for (const id of rest) if (book.photos?.[id]) out.set(id, fromInline(id, book.photos[id]));
+      return out;
+    }
+    await idb("readonly", (store) => {
+      for (const id of rest) {
+        const req = store.get(photoKey(id));
+        req.onsuccess = () => req.result && out.set(id, req.result);
+      }
+    });
+    return out;
+  }
+  // File signatures we are willing to decode: JPEG, PNG, WebP, HEIC/HEIF.
+  function sniffImage(head) {
+    const b = new Uint8Array(head), text = (a, z) => String.fromCharCode(...b.subarray(a, z));
+    if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "jpeg";
+    if (b[0] === 0x89 && text(1, 4) === "PNG") return "png";
+    if (text(0, 4) === "RIFF" && text(8, 12) === "WEBP") return "webp";
+    if (text(4, 8) === "ftyp" && /^(heic|heix|hevc|heim|heis|mif1|msf1)$/.test(text(8, 12))) return "heic";
+    return "";
+  }
+  function decodeImage(blob) {
+    // <img> honours camera orientation everywhere; createImageBitmap is the fallback.
+    const viaImage = new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob), img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(Error("decode")); };
+      img.src = url;
+    });
+    const fallback = () => window.createImageBitmap
+      ? createImageBitmap(blob, { imageOrientation: "from-image" })
+      : Promise.reject(Error("decode"));
+    let timer;
+    const late = new Promise((resolve, reject) => {
+      timer = setTimeout(() => fallback().then(resolve, reject), 8000);
+    });
+    return Promise.race([viaImage, late])
+      .catch(fallback)
+      .catch(() => { throw Error("无法读取这张照片，请换一张试试。"); })
+      .finally(() => clearTimeout(timer));
+  }
+  const sizeOf = (img) => [img.naturalWidth || img.width, img.naturalHeight || img.height];
+  function scaled(img, side) {
+    const [w, h] = sizeOf(img), s = Math.min(1, side / Math.max(w, h));
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(w * s));
+    c.height = Math.max(1, Math.round(h * s));
+    const x = c.getContext("2d");
+    x.fillStyle = "#fff";
+    x.fillRect(0, 0, c.width, c.height);
+    x.drawImage(img, 0, 0, c.width, c.height);
+    return c;
+  }
+  const jpeg = (canvas, quality) => new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b && b.type === "image/jpeg" ? resolve(b) : reject(Error("照片压缩失败，请再试一次。"))), "image/jpeg", quality));
+  // Re-encoding drops EXIF (including GPS) and anything hidden in the file.
+  // Walks the JPEG header up to the scan. "clean" means: baseline or progressive,
+  // no metadata besides the plain JFIF header, so the bytes are safe to keep as-is.
+  function jpegScan(b) {
+    if (b.length < 4 || b[0] !== 0xff || b[1] !== 0xd8) return null;
+    const keep = [];
+    let i = 2, clean = true, frame = null;
+    while (i + 4 <= b.length) {
+      if (b[i] !== 0xff) return null;
+      while (b[i + 1] === 0xff && i + 2 < b.length) i++; // fill bytes
+      const m = b[i + 1];
+      if (m === 0xd8 || m === 0xd9 || m === 0x00) return null;
+      if ((m >= 0xd0 && m <= 0xd7) || m === 0x01) { i += 2; continue; }
+      const len = (b[i + 2] << 8) | b[i + 3];
+      if (len < 2 || i + 2 + len > b.length) return null;
+      const end = i + 2 + len;
+      if (m === 0xda) return frame ? { clean: clean && frame.plain, keep, scan: i, frame } : null;
+      let meta = false;
+      if (m === 0xe0) meta = String.fromCharCode(...b.subarray(i + 4, i + 9)) !== "JFIF\0";
+      else if ((m >= 0xe1 && m <= 0xef) || m === 0xfe) meta = true;
+      else if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+        if (frame || len < 8) return null;
+        frame = {
+          plain: m === 0xc0 || m === 0xc2,
+          height: (b[i + 5] << 8) | b[i + 6],
+          width: (b[i + 7] << 8) | b[i + 8],
+        };
+      }
+      if (meta) clean = false;
+      else keep.push([i, end]);
+      i = end;
+    }
+    return null;
+  }
+  // Drops metadata segments from a JPEG this app just encoded (some browsers add them).
+  function stripJpeg(buffer) {
+    const b = new Uint8Array(buffer), info = jpegScan(b);
+    if (!info) throw Error("照片压缩失败，请再试一次。");
+    if (info.clean) return buffer;
+    const parts = [b.subarray(0, 2), ...info.keep.map(([a, z]) => b.subarray(a, z)), b.subarray(info.scan)];
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.length; }
+    return out.buffer;
+  }
+  async function encodePhoto(img) {
+    const canvas = scaled(img, PHOTO.side);
+    let quality = PHOTO.quality, blob = await jpeg(canvas, quality);
+    while (blob.size > PHOTO.maxBytes * 0.5 && quality > 0.5) {
+      quality -= 0.1;
+      blob = await jpeg(canvas, quality);
+    }
+    const bytes = stripJpeg(await blob.arrayBuffer());
+    if (bytes.byteLength > PHOTO.maxBytes) throw Error("照片压缩后仍太大，请换一张。");
+    const thumb = await jpeg(scaled(canvas, PHOTO.thumb), 0.72);
+    return {
+      canvas,
+      record: {
+        id: uid(), type: "image/jpeg", width: canvas.width, height: canvas.height,
+        size: bytes.byteLength, at: now(), draft: true,
+        bytes, thumb: await thumb.arrayBuffer(),
+      },
+    };
+  }
+  async function compressPhoto(file) {
+    if (!file?.size) throw Error("没有读到照片。");
+    if (/svg|xml|html/i.test(file.type)) throw Error("只能添加照片（JPEG、HEIC、PNG 或 WebP）。");
+    if (file.size > PHOTO.maxInput) throw Error("这张照片超过 40 MB，请换一张。");
+    if (!sniffImage(await file.slice(0, 16).arrayBuffer()))
+      throw Error("只能添加照片（JPEG、HEIC、PNG 或 WebP）。");
+    const img = await decodeImage(file);
+    const [w, h] = sizeOf(img);
+    if (!w || !h || w * h > PHOTO.maxPixels) throw Error("无法读取这张照片，请换一张试试。");
+    try {
+      return await encodePhoto(img);
+    } finally {
+      img.close?.();
+    }
+  }
+  // A backup photo must be a complete JPEG that decodes to the stated size.
+  async function verifyInline(id, p) {
+    if (!photoIdPattern.test(id) || !inlineShapeOk(p) || !/^[A-Za-z0-9+/]+={0,2}$/.test(p.data))
+      throw Error("shape");
+    const bytes = new Uint8Array(fromBase64(p.data));
+    const n = bytes.length;
+    if (n > PHOTO.maxBytes || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff ||
+        bytes[n - 2] !== 0xff || bytes[n - 1] !== 0xd9) throw Error("bytes");
+    const info = jpegScan(bytes);
+    if (!info || info.frame.width !== p.width || info.frame.height !== p.height) throw Error("header");
+    const img = await decodeImage(new Blob([bytes], { type: "image/jpeg" }));
+    try {
+      const [w, h] = sizeOf(img);
+      if (w !== p.width || h !== p.height) throw Error("size");
+      // A clean JPEG (what this app writes) is restored byte for byte. Anything
+      // with extra metadata, an unusual coding mode or an oversize frame is
+      // re-encoded once; the result is clean, so later round trips are exact.
+      if (info.clean && w <= PHOTO.side && h <= PHOTO.side) {
+        const thumb = await jpeg(scaled(img, PHOTO.thumb), 0.72);
+        return {
+          id, type: "image/jpeg", width: w, height: h, size: n, at: now(), draft: false,
+          bytes: bytes.buffer, thumb: await thumb.arrayBuffer(), restored: "exact",
+        };
+      }
+      const { record } = await encodePhoto(img);
+      return { ...record, id, draft: false, restored: "normalised" };
+    } finally {
+      img.close?.();
+    }
+  }
+  // Note references must describe the bytes actually stored.
+  function syncPhotoMeta(data, photos) {
+    for (const p of data.players) for (const n of p.notes) {
+      const rec = n.photo && photos.get(n.photo.id);
+      if (rec) n.photo = { id: rec.id, type: rec.type, width: rec.width, height: rec.height, size: rec.size };
+    }
+  }
+  async function storageNote(extra) {
+    try {
+      const est = await navigator.storage?.estimate?.();
+      if (est?.quota && est.quota - est.usage < Math.max(extra * 20, 30 * 1024 * 1024))
+        toast("本机可用存储不多，照片可能存不下。建议先保存完整备份。");
+    } catch { /* estimates are optional */ }
   }
   const chronology = () =>
     book.players
@@ -349,7 +659,7 @@
     const controls = detail && p !== demo
       ? `<div class="note-controls"><button class="linkbtn" data-action="assign" data-player="${esc(p.id)}" data-id="${esc(n.id)}">${inbox ? "关联牌手" : "更改关联"}</button><button class="iconbtn" data-action="edit-note" data-player="${esc(p.id)}" data-id="${esc(n.id)}" aria-label="编辑本条记录">${icon("edit")}</button></div>`
       : "";
-    return `<article class="entry"><div class="entry-meta"><time>${p === demo ? "示例" : esc(fmt(n.at))}</time>${place}${n.street && n.street !== "综合" ? `<span class="street">${esc(n.street)}</span>` : ""}</div>${n.text ? `<p>${esc(short ? n.text.slice(0, 105) + (n.text.length > 105 ? "…" : "") : n.text)}</p>` : ""}${!short ? cardsBlock(n) : !n.text ? `<div class="cards">${noteArrays(n).flat().map(cardHTML).join("")}</div>` : ""}${!short && n.reflection ? `<p class="reflection"><strong>我的复盘</strong> ${esc(n.reflection)}</p>` : ""}${controls}</article>`;
+    return `<article class="entry"><div class="entry-meta"><time>${p === demo ? "示例" : esc(fmt(n.at))}</time>${place}${n.street && n.street !== "综合" ? `<span class="street">${esc(n.street)}</span>` : ""}</div>${n.photo ? photoThumb(n.photo, "entry-photo") : ""}${n.text ? `<p>${esc(short ? n.text.slice(0, 105) + (n.text.length > 105 ? "…" : "") : n.text)}</p>` : ""}${!short ? cardsBlock(n) : !n.text ? `<div class="cards">${noteArrays(n).flat().map(cardHTML).join("")}</div>` : ""}${!short && n.reflection ? `<p class="reflection"><strong>我的复盘</strong> ${esc(n.reflection)}</p>` : ""}${controls}</article>`;
   }
   function home() {
     const players = roster();
@@ -403,6 +713,7 @@
         n.street,
         n.text,
         n.reflection,
+        n.photo ? "照片" : "",
         ...noteArrays(n)
           .flat()
           .map((c) => (c[0] === "T" ? "10" : c[0]) + suits[c[1]]),
@@ -418,8 +729,16 @@
   // Each draft has its own key. A second window editing a stale copy forks its
   // draft instead of overwriting the newer text. Only a committed copy is cleared.
   const draftPrefix = "felt-notes:compose:";
-  const newDraft = () => ({ id: uid(), text: "", target: "", at: now() });
+  // A draft may also carry a photo reference and a confirmed board. The photo
+  // bytes live in IndexedDB; only the small reference goes to localStorage.
+  const newDraft = () => ({ id: uid(), text: "", target: "", at: now(), photo: null, board: [] });
   let draft = newDraft(), storedDraft = null, draftWarning = "";
+  const hasDraft = (d) => !!(d.text || d.photo);
+  function cleanBoard(list) {
+    if (!Array.isArray(list) || list.length > 5) return [];
+    const cards = list.filter((c) => typeof c === "string" && cardPattern.test(c));
+    return cards.length === list.length && new Set(cards).size === cards.length ? cards : [];
+  }
   function availableDrafts() {
     const found = [];
     try {
@@ -428,8 +747,11 @@
         const raw = localStorage.getItem(key);
         let value;
         try { value = JSON.parse(raw); } catch { continue; }
-        if (value && key === draftPrefix + value.id && typeof value.text === "string" &&
-            value.text && value.text.length <= 30000 && Number.isFinite(Date.parse(value.at))) {
+        if (!value || typeof value !== "object") continue;
+        value.photo = photoMetaOk(value.photo) ? value.photo : null;
+        value.board = value.photo ? cleanBoard(value.board) : [];
+        if (key === draftPrefix + value.id && typeof value.text === "string" &&
+            hasDraft(value) && value.text.length <= 30000 && Number.isFinite(Date.parse(value.at))) {
           found.push({ value, raw });
         }
       }
@@ -439,10 +761,14 @@
   function loadDraft(item) {
     draft = item.value;
     storedDraft = item.raw;
+    recog = null;
   }
   function writeDraft(text) {
-    if (!draft.text && text) draft.at = now();
+    if (!hasDraft(draft) && text) draft.at = now();
     draft.text = text;
+    persistDraft();
+  }
+  function persistDraft() {
     try {
       let key = draftPrefix + draft.id;
       if (localStorage.getItem(key) !== storedDraft) {
@@ -450,7 +776,7 @@
         key = draftPrefix + draft.id;
       }
       draft.changed = now();
-      const next = text ? JSON.stringify(draft) : null;
+      const next = hasDraft(draft) ? JSON.stringify(draft) : null;
       if (next) localStorage.setItem(key, next);
       else localStorage.removeItem(key);
       storedDraft = next;
@@ -459,8 +785,134 @@
   }
   function syncComposer() {
     const status = $("#draft-status"), save = $("#quick-save");
-    if (status) status.textContent = draftWarning || (draft.text ? "草稿已保存" : "");
-    if (save) save.disabled = !draft.text.trim();
+    const picker = $("#photo-file");
+    if (picker) picker.disabled = photoBusy;
+    if (status) status.textContent = draftWarning ||
+      (photoBusy ? "正在处理照片…" : hasDraft(draft) ? "草稿已保存" : "");
+    if (save) save.disabled = photoBusy || !(draft.text.trim() || draft.photo);
+  }
+
+  /* ---------- photo in the composer ---------- */
+
+  function photoThumb(meta, cls = "") {
+    return `<button type="button" class="photo-thumb ${cls}" data-action="view-photo" data-id="${esc(meta.id)}" aria-label="查看照片"><img data-photo="${esc(meta.id)}" alt=""><span class="photo-missing">照片不在本机</span></button>`;
+  }
+  const act = (txt, action, cls = "") =>
+    `<button type="button" class="photo-act ${cls}" data-action="${action}">${txt}</button>`;
+  function boardLine() {
+    if (draft.board.length)
+      return `<span class="board-label">公共牌</span><span class="cards">${draft.board.map(cardHTML).join("")}</span>${act("修改", "board-edit")}`;
+    const r = recog?.id === draft.photo.id ? recog : null;
+    if (!r || r.state === "idle")
+      return `${act("识别公共牌", "board-scan")}${act("手动选牌", "board-edit")}`;
+    if (r.state === "running") return `<span class="board-label" role="status">正在识别公共牌…</span>`;
+    if (r.state === "done") {
+      const chips = r.cards.map((c) => c.code && c.sure ? cardHTML(c.code)
+        : c.code ? cardHTML(c.code).replace('class="playing', 'class="playing unsure') : '<span class="playing guess" aria-label="未认出">?</span>').join("");
+      return r.sure
+        ? `<span class="board-label">识别结果，请核对</span><span class="cards">${chips}</span>${act("确认", "board-accept", "strong")}${act("修改", "board-edit")}${act("忽略", "board-dismiss")}`
+        : `<span class="board-label">没把握，请手动核对</span><span class="cards">${chips}</span>${act("手动选牌", "board-edit", "strong")}${act("只留照片", "board-dismiss")}`;
+    }
+    if (r.state === "dismissed") return act("选公共牌", "board-edit");
+    return `<span class="board-label">${r.state === "error" ? "识别没成功" : "没认出一排公共牌"}</span>${act("手动选牌", "board-edit")}`;
+  }
+  function photoPanel() {
+    return `${photoThumb(draft.photo)}<div class="photo-side"><div class="board-line">${boardLine()}</div>${act("移除照片", "remove-photo", "muted-act")}</div>`;
+  }
+  function paintPhoto() {
+    const el = $("#compose-photo");
+    if (!el) return;
+    el.hidden = !draft.photo;
+    el.innerHTML = draft.photo ? photoPanel() : "";
+    hydratePhotos(el);
+    syncComposer();
+  }
+  async function hydratePhotos(scope) {
+    const imgs = [...scope.querySelectorAll("img[data-photo]")].filter((i) => !i.getAttribute("src"));
+    if (!imgs.length) return;
+    const ids = [...new Set(imgs.map((i) => i.dataset.photo))].filter((id) => !thumbUrls.has(id));
+    let found = new Map();
+    try { found = await loadPhotos(ids); } catch { /* shown as missing */ }
+    for (const [id, rec] of found) thumbUrls.set(id, URL.createObjectURL(blobOf(rec, true)));
+    for (const img of imgs) {
+      const url = thumbUrls.get(img.dataset.photo);
+      if (url) img.src = url;
+      else img.parentElement.classList.add("missing");
+    }
+  }
+  async function addPhoto(file) {
+    if (photoBusy) throw Error("正在保存上一张照片，请稍等。");
+    photoBusy = true;
+    syncComposer();
+    let made;
+    try {
+      made = await compressPhoto(file);
+      const { record } = made;
+      storageNote(record.size);
+      if (!native) await idb("readwrite", (store) => { store.put(record, photoKey(record.id)); });
+      memPhotos.set(record.id, record);
+    } finally {
+      photoBusy = false;
+      syncComposer();
+    }
+    const { record, canvas } = made;
+    if (!hasDraft(draft)) draft.at = now();
+    draft.photo = { id: record.id, type: record.type, width: record.width, height: record.height, size: record.size };
+    draft.board = [];
+    persistDraft();
+    if (native) draftWarning = "照片在保存笔记后才会存档";
+    recognise(record.id, canvas);
+    sweepLater();
+    requestStandaloneStorage();
+  }
+  // Recognition never blocks saving: it starts after the preview is shown.
+  function recognise(id, source) {
+    if (!vision) {
+      recog = { id, state: "idle" };
+      paintPhoto();
+      return;
+    }
+    recog = { id, state: "running" };
+    paintPhoto();
+    setTimeout(() => {
+      let result = null;
+      try { result = vision.detect(source); } catch { /* reported below */ }
+      if (draft.photo?.id !== id) return;
+      if (!result) recog = { id, state: "error" };
+      else if (!result.found) recog = { id, state: "none" };
+      else recog = { id, state: "done", sure: result.sure, cards: result.cards };
+      paintPhoto();
+    }, 80);
+  }
+  async function scanStored() {
+    const id = draft.photo?.id;
+    const rec = id && (await loadPhotos([id])).get(id);
+    if (!rec) throw Error("照片已不在本机，请移除后重新添加。");
+    recog = { id, state: "running" };
+    paintPhoto();
+    const img = await decodeImage(blobOf(rec, false));
+    recognise(id, img);
+  }
+  async function fillFull(img, id) {
+    const rec = (await loadPhotos([id])).get(id);
+    if (!rec) throw Error("这张照片不在本机（可能来自不含照片的备份）。");
+    if (fullPhotoUrl) URL.revokeObjectURL(fullPhotoUrl);
+    fullPhotoUrl = URL.createObjectURL(blobOf(rec, false));
+    img.width = rec.width;
+    img.height = rec.height;
+    img.src = fullPhotoUrl;
+  }
+  function boardForm() {
+    const r = recog?.id === draft.photo?.id ? recog : null;
+    const start = draft.board.length ? draft.board
+      : r?.state === "done" ? r.cards.filter((c) => c.code && c.sure).map((c) => c.code) : [];
+    draftCards = { heroCards: [], villainCards: [], board: [...new Set(start)] };
+    cardPicker = null;
+    editorGroups = ["board"];
+    show("公共牌", `<form id="board-form">${draft.photo ? `<img class="photo-full board-ref" alt="牌局照片">` : ""}<p class="muted">对照照片核对点数和花色。看不清的牌可以空着。</p><div id="card-editor"></div>${formEnd("确认公共牌")}`);
+    drawCards();
+    const ref = modal.querySelector(".board-ref");
+    if (ref) fillFull(ref, draft.photo.id).catch(() => ref.remove());
   }
   function timeline() {
     const target = playerBy(draft.target);
@@ -470,12 +922,13 @@
       <form class="compose" id="quick-form">
         ${target ? `<div class="compose-for">记给 ${esc(target.name)} <button type="button" class="linkbtn" data-action="detach-draft">取消关联</button></div>` : ""}
         <textarea id="quick-text" aria-label="笔记正文" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="记一手牌，或写下刚看到的动作…" maxlength="30000" rows="4"></textarea>
-        <div class="compose-footer"><span class="quiet" id="draft-status"></span><button type="submit" id="quick-save" class="btn solid">保存笔记</button></div>
+        <div id="compose-photo" class="compose-photo" hidden></div>
+        <div class="compose-footer"><label class="photo-btn" title="拍照或选照片">${icon("camera")}<span>照片</span><input type="file" id="photo-file" class="visually-hidden" accept="image/*" aria-label="拍照或选照片"></label><span class="quiet" id="draft-status"></span><button type="submit" id="quick-save" class="btn solid">保存笔记</button></div>
       </form>
-      ${rest.length ? `<details class="other-drafts"><summary>其他草稿（${rest.length}）</summary>${rest.map(({value}) => button(value.text.slice(0, 40), "resume-draft", "edit", "outline", value.id)).join("")}</details>` : ""}
+      ${rest.length ? `<details class="other-drafts"><summary>其他草稿（${rest.length}）</summary>${rest.map(({value}) => button((value.photo ? "［照片］" : "") + value.text.slice(0, 40), "resume-draft", "edit", "outline", value.id)).join("")}</details>` : ""}
       <section class="journal"><div class="section-head"><h2>最近笔记</h2></div><label class="search">${icon("search")}<input aria-label="筛选笔记" id="note-search" placeholder="搜索笔记或牌手" value="${esc(selState.noteQuery)}"></label><div id="timeline-list">${timelineList()}</div></section></div>`;
     $("#quick-text").value = draft.text;
-    syncComposer();
+    paintPhoto();
   }
   function ensureInbox(data) {
     let inbox = data.players.find((p) => p.id === inboxId);
@@ -487,23 +940,33 @@
   }
   async function saveQuick() {
     const input = $("#quick-text");
-    if (!input.value.trim()) throw Error("先写一点内容。");
+    if (photoBusy) throw Error("照片还在处理，请稍等。");
+    if (!input.value.trim() && !draft.photo) throw Error("先写一点内容，或加一张照片。");
     if (input.value !== draft.text) writeDraft(input.value);
-    const snapshot = { ...draft }, written = storedDraft, stamp = now();
+    const snapshot = { ...draft, board: [...draft.board] }, written = storedDraft, stamp = now();
+    let photo = null;
+    if (snapshot.photo) {
+      photo = (await loadPhotos([snapshot.photo.id])).get(snapshot.photo.id);
+      if (!photo) throw Error("照片已不在本机，请移除后重新添加。文字草稿还在。");
+    }
     input.readOnly = true;
     try {
       await change((data) => {
         const dest = snapshot.target ? requirePlayer(data, snapshot.target) : ensureInbox(data);
         const prior = data.players.flatMap((p) => p.notes).find((n) => n.id === snapshot.id);
-        if (prior && prior.text === snapshot.text) return;
+        if (prior && prior.text === snapshot.text && (prior.photo?.id || "") === (snapshot.photo?.id || "")) return;
         const id = prior ? uid() : snapshot.id;
-        dest.notes.push({ id, at: snapshot.at, updatedAt: stamp, text: snapshot.text, street: "", reflection: "" });
+        const note = { id, at: snapshot.at, updatedAt: stamp, text: snapshot.text, street: "", reflection: "" };
+        if (snapshot.board.length) note.board = snapshot.board;
+        if (snapshot.photo) note.photo = { ...snapshot.photo };
+        dest.notes.push(note);
         if (!dest.fieldTimes) dest.fieldTimes = Object.fromEntries(profileFields.map((k) => [k, fieldStamp(dest, k)]));
         dest.updatedAt = stamp;
-      });
+      }, photo ? { save: [photo] } : null);
     } finally {
       input.readOnly = false;
     }
+    if (photo) memPhotos.delete(photo.id);
     try {
       const key = draftPrefix + snapshot.id;
       if (localStorage.getItem(key) === written) localStorage.removeItem(key);
@@ -512,6 +975,7 @@
       draft = newDraft();
       storedDraft = null;
       draftWarning = "";
+      recog = null;
     }
     selState.noteQuery = "";
     render();
@@ -542,7 +1006,7 @@
         )
         .join(
           "",
-        )}</div><p class="muted">导出用代号替换牌手昵称，并省略辨认特征。笔记、长期打法和自定义标签会保留原文，交给 AI 前请先看一遍。</p>${roster().length ? `<details class="private-map"><summary>在本机对照牌手代号</summary>${roster().map((p, i) => `<div><b>P${String(i + 1).padStart(2, "0")}</b> ${esc(p.name)}</div>`).join("")}</details>` : ""}<pre class="readtext export-preview">${esc(report)}</pre><div class="actions">${button("导出 Markdown", "export-md", "download", "solid")}${button("复制全文", "copy-md", "copy")}</div></section><aside class="panel"><div class="section-head"><h2>完整备份</h2>${icon("download")}</div><p class="sidecopy">JSON 包含所有昵称、特征、花色与长期笔记。换手机或清理数据前，先保存一份。</p><div class="stack">${button("保存完整备份", "backup", "download")}${button("从备份合并", "restore", "plus", "soft")}</div><input type="file" accept=".json,application/json" hidden id="restore-file"><p class="footnote">手机和电脑各自存档。可把 JSON 文件存到 iCloud 云盘，换手机时点「从备份合并」。</p>${native ? "" : `<p class="footnote" id="offline-status" role="status">${esc(offlineStatus)}</p>`}</aside></div>`;
+        )}</div><p class="muted">导出用代号替换牌手昵称，并省略辨认特征。笔记、长期打法和自定义标签会保留原文，交给 AI 前请先看一遍。</p>${roster().length ? `<details class="private-map"><summary>在本机对照牌手代号</summary>${roster().map((p, i) => `<div><b>P${String(i + 1).padStart(2, "0")}</b> ${esc(p.name)}</div>`).join("")}</details>` : ""}<pre class="readtext export-preview">${esc(report)}</pre><div class="actions">${button("导出 Markdown", "export-md", "download", "solid")}${button("复制全文", "copy-md", "copy")}</div></section><aside class="panel"><div class="section-head"><h2>完整备份</h2>${icon("download")}</div><p class="sidecopy">JSON 包含所有昵称、特征、花色、长期笔记和照片的压缩副本。换手机或清理数据前，先保存一份。</p><div class="stack">${button("保存完整备份", "backup", "download")}${photoIdsIn(book).size ? button("不含照片的备份", "backup-text", "", "outline") : ""}${button("从备份合并", "restore", "plus", "soft")}</div><input type="file" accept=".json,application/json" hidden id="restore-file"><p class="footnote">手机和电脑各自存档。可把 JSON 文件存到 iCloud 云盘，换手机时点「从备份合并」。</p>${native ? "" : `<p class="footnote" id="offline-status" role="status">${esc(offlineStatus)}</p>`}</aside></div>`;
   }
   function render() {
     paintNav();
@@ -550,6 +1014,7 @@
     else if (selState.page === "notes") timeline();
     else if (selState.page === "export") exportPage();
     else home();
+    hydratePhotos(root);
   }
   function show(title, body) {
     focusBefore = document.activeElement;
@@ -562,6 +1027,12 @@
     modal.replaceChildren();
     pendingImport = null;
     cardPicker = null;
+    editorGroups = null;
+    dropPhoto = false;
+    if (fullPhotoUrl) {
+      URL.revokeObjectURL(fullPhotoUrl);
+      fullPhotoUrl = null;
+    }
     if (focusBefore?.isConnected) focusBefore.focus({ preventScroll: true });
   }
   dialog.addEventListener("cancel", (e) => {
@@ -610,19 +1081,23 @@
       Object.keys(groups).map((k) => [k, [...(n?.[k] || [])]]),
     );
     cardPicker = null;
+    editorGroups = null;
+    dropPhoto = false;
     const choices = n.street && !streets.includes(n.street) ? [...streets, n.street] : streets;
     show(
       "编辑笔记",
-      `<form id="note-form" data-player="${esc(p.id)}" data-note="${esc(n.id)}" data-version="${esc(n.updatedAt || n.at)}">${field("obs", "笔记正文")}<textarea class="field-input" id="obs" maxlength="30000" rows="6"></textarea><details class="hand-details"><summary>手牌详情与复盘</summary>${field("street", "街次")}<select class="field-input" id="street"><option value="">未标记</option>${choices.map((v) => `<option ${n.street === v ? "selected" : ""}>${esc(v)}</option>`).join("")}</select><div id="card-editor"></div>${field("reflect", "我的复盘", "选填")}<textarea class="field-input" id="reflect" maxlength="30000" rows="3"></textarea>${field("note-time", "记录时间")}<input id="note-time" class="field-input" type="datetime-local" value="${localTime(n.at)}" required></details>${formEnd("保存修改")}`,
+      `<form id="note-form" data-player="${esc(p.id)}" data-note="${esc(n.id)}" data-version="${esc(n.updatedAt || n.at)}" data-photo="${esc(n.photo?.id || "")}">${field("obs", "笔记正文")}<textarea class="field-input" id="obs" maxlength="30000" rows="6"></textarea>${n.photo ? `<div class="photo-edit" id="photo-edit">${photoThumb(n.photo)}<button type="button" class="linkbtn" data-action="toggle-photo" aria-pressed="false">移除照片</button></div>` : ""}<details class="hand-details"><summary>手牌详情与复盘</summary>${field("street", "街次")}<select class="field-input" id="street"><option value="">未标记</option>${choices.map((v) => `<option ${n.street === v ? "selected" : ""}>${esc(v)}</option>`).join("")}</select><div id="card-editor"></div>${field("reflect", "我的复盘", "选填")}<textarea class="field-input" id="reflect" maxlength="30000" rows="3"></textarea>${field("note-time", "记录时间")}<input id="note-time" class="field-input" type="datetime-local" value="${localTime(n.at)}" required></details>${formEnd("保存修改")}`,
     );
     $("#obs").value = n.text || "";
     $("#reflect").value = n.reflection || "";
     drawCards();
+    hydratePhotos(modal);
   }
   function drawCards() {
     const el = $("#card-editor");
     let html = "";
     for (const [k, [name, max]] of Object.entries(groups)) {
+      if (editorGroups && !editorGroups.includes(k)) continue;
       html += `<div class="card-field"><span>${name}</span><div class="cards">${draftCards[k].map((c, i) => `<button type="button" class="edit-card" data-action="pick-card" data-id="${k}/${i}" aria-label="修改${name} ${esc(c)}">${cardHTML(c)}</button>`).join("")}${draftCards[k].length < max ? `<button type="button" class="blank-card" data-action="pick-card" data-id="${k}/${draftCards[k].length}" aria-label="添加${name}">＋</button>` : ""}</div></div>`;
       if (cardPicker?.group === k) {
         const cur = draftCards[k][cardPicker.index],
@@ -779,14 +1254,62 @@
     }
     existing.players = [...profiles.values()];
   }
-  function openImport(raw) {
-    const incoming = checkBook(raw);
+  // Backups may carry photos as base64 JPEG. Each one is decoded and re-encoded
+  // here before anything is written; a photo that fails is skipped, not trusted.
+  async function openImport(raw) {
+    let obj;
+    try {
+      obj = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+      throw Error("请选择牌桌手记导出的 JSON 完整备份。");
+    }
+    if (!obj || typeof obj !== "object") throw Error("请选择牌桌手记导出的 JSON 完整备份。");
+    const { photos: rawPhotos, ...rest } = obj;
+    const incoming = checkBook(rest);
+    if (rawPhotos != null && (typeof rawPhotos !== "object" || Array.isArray(rawPhotos)))
+      throw Error("备份中的照片区格式无效。");
+    const wanted = [...photoIdsIn(incoming)];
+    const photos = new Map();
+    let rejected = 0, absent = 0;
+    if (wanted.length) show("合并这份备份", `<p class="muted" role="status">正在检查 ${wanted.length} 张照片…</p>`);
+    for (const id of wanted) {
+      const p = rawPhotos && Object.hasOwn(rawPhotos, id) ? rawPhotos[id] : null;
+      if (!p) { absent++; continue; }
+      try { photos.set(id, await verifyInline(id, p)); } catch { rejected++; }
+    }
+    const notes = incoming.players.reduce((n, p) => n + p.notes.length, 0);
+    const photoLine = wanted.length
+      ? `<p class="muted">照片：${photos.size} 张通过检查${[...photos.values()].some((r) => r.restored === "normalised") ? `（其中 ${[...photos.values()].filter((r) => r.restored === "normalised").length} 张带有额外信息，已在本机重新整理）` : ""}${rejected ? `；<strong>${rejected} 张不是有效照片，将跳过</strong>` : ""}${absent ? `；${absent} 张不在这份文件里（对应记录照常导入，只是没有照片）` : ""}。</p>`
+      : "";
     show(
       "合并这份备份",
-      `<p>文件有 <strong>${roster(incoming).length}</strong> 位牌手、<strong>${incoming.players.reduce((n, p) => n + p.notes.length, 0)}</strong> 条记录。同一份档案按各栏的编辑时间合并；同一手牌保留较新版本，其余记录追加。</p><div class="modal-actions">${button("取消", "close")}${button("确认合并", "merge", "", "solid")}</div><p id="form-error" class="error-msg" role="alert"></p>`,
+      `<p>文件有 <strong>${roster(incoming).length}</strong> 位牌手、<strong>${notes}</strong> 条记录。同一份档案按各栏的编辑时间合并；同一手牌保留较新版本，其余记录追加。</p>${photoLine}<div class="modal-actions">${button("取消", "close")}${button("确认合并", "merge", "", "solid")}</div><p id="form-error" class="error-msg" role="alert"></p>`,
       "restore",
     );
-    pendingImport = incoming;
+    pendingImport = { book: incoming, photos };
+  }
+  async function saveBackup(withPhotos) {
+    const out = { ...book };
+    delete out.photos;
+    const ids = [...photoIdsIn(book)];
+    let missing = 0;
+    if (withPhotos && ids.length) {
+      const found = await loadPhotos(ids);
+      out.photos = {};
+      for (const id of ids) {
+        const rec = found.get(id);
+        if (rec) out.photos[id] = toInline(rec);
+        else missing++;
+      }
+    }
+    const text = JSON.stringify(out, null, 2);
+    if (text.length > MAX_BACKUP_BYTES)
+      throw Error("备份超过 300 MB。请先用「不含照片的备份」保存文字。");
+    const tag = withPhotos ? "" : "无照片-";
+    await saveFile(`牌桌手记备份-${tag}${todayFile()}.json`, text, "application/json");
+    const mb = (text.length / 1048576).toFixed(text.length < 10485760 ? 1 : 0);
+    const kept = withPhotos ? ids.length - missing : 0;
+    toast(`备份约 ${mb} MB${kept ? `，含 ${kept} 张照片` : withPhotos ? "" : "，不含照片"}${missing ? `；${missing} 张照片本机已缺失` : ""}`);
   }
   function showError(e) {
     const msg = e?.message || "操作失败，请再试。";
@@ -835,6 +1358,17 @@
     let nextId;
     if (form.id === "quick-form") return saveQuick();
     if (form.id === "assign-form") return assignNote(form);
+    if (form.id === "board-form") {
+      if (cardPicker?.rank)
+        throw Error("这张牌还缺花色，请选择花色或点「收起」取消选牌。");
+      if (!draft.photo) throw Error("照片已移除，请重新添加。");
+      draft.board = [...draftCards.board];
+      persistDraft();
+      if (recog?.id === draft.photo.id) recog = { ...recog, state: "dismissed" };
+      close();
+      paintPhoto();
+      return;
+    }
     if (form.id === "profile-form") {
       const name = $("#pname").value.trim();
       if (!name) throw Error("请给牌手起一个昵称。");
@@ -876,12 +1410,14 @@
       const oldId = form.dataset.note, target = form.dataset.player;
       const observation = $("#obs").value, reflection = $("#reflect").value,
         street = $("#street").value, atRaw = $("#note-time").value;
+      const keepsPhoto = !!form.dataset.photo && !dropPhoto;
       if (
         !observation.trim() &&
         !reflection.trim() &&
+        !keepsPhoto &&
         !Object.values(draftCards).some((a) => a.length)
       )
-        throw Error("请写一句观察、选一张牌，或填写你的复盘。");
+        throw Error("请写一句观察、选一张牌、保留照片，或填写你的复盘。");
       if (!atRaw || !Number.isFinite(Date.parse(atRaw)))
         throw Error("请选择有效的记录时间。");
       if (cardPicker?.rank)
@@ -912,14 +1448,21 @@
           updatedAt: stamp,
           ...cards,
         });
+        if (!keepsPhoto) delete n.photo;
         p.updatedAt = stamp;
       });
+      const dropped = !!form.dataset.photo && !keepsPhoto;
       close();
       render();
       toast("修改已保存");
+      if (dropped) sweepLater();
     }
   }
   async function handle(action, id, owner) {
+    if (photoBusy && ["add-note", "resume-draft", "detach-draft", "remove-photo", "board-edit", "board-accept", "board-scan"].includes(action)) {
+      toast("照片处理好后就可以切换或修改草稿。");
+      return;
+    }
     switch (action) {
       case "nav":
         move(id);
@@ -941,7 +1484,7 @@
         exploitForm(playerBy(id));
         break;
       case "add-note":
-        if (draft.text && draft.target !== id) { draft = newDraft(); storedDraft = null; }
+        if (hasDraft(draft) && draft.target !== id) { draft = newDraft(); storedDraft = null; recog = null; }
         draft.target = id || "";
         move("notes");
         $("#quick-text").focus();
@@ -959,6 +1502,47 @@
       case "assign":
         assignForm(owner, id);
         break;
+      case "view-photo": {
+        show("照片", `<img class="photo-full" alt="牌局照片"><p class="muted">本机保存的压缩副本。</p>`);
+        await fillFull(modal.querySelector(".photo-full"), id);
+        break;
+      }
+      case "remove-photo":
+        draft.photo = null;
+        draft.board = [];
+        recog = null;
+        persistDraft();
+        paintPhoto();
+        sweepLater();
+        break;
+      case "board-scan":
+        await scanStored();
+        break;
+      case "board-accept":
+        if (recog?.state === "done" && recog.sure && draft.photo?.id === recog.id) {
+          draft.board = recog.cards.map((c) => c.code);
+          persistDraft();
+          recog = { ...recog, state: "dismissed" };
+          paintPhoto();
+        }
+        break;
+      case "board-edit":
+        boardForm();
+        break;
+      case "board-dismiss":
+        if (recog) recog = { ...recog, state: "dismissed" };
+        paintPhoto();
+        break;
+      case "toggle-photo": {
+        dropPhoto = !dropPhoto;
+        $("#photo-edit")?.classList.toggle("dropped", dropPhoto);
+        const b = $("#photo-edit button.linkbtn");
+        if (b) {
+          b.textContent = dropPhoto ? "保留照片" : "移除照片";
+          b.setAttribute("aria-pressed", String(dropPhoto));
+        }
+        break;
+      }
       case "assign-existing":
         await assignNote($("#assign-form"), id);
         break;
@@ -1043,22 +1627,25 @@
         );
         break;
       case "backup":
-        await saveFile(
-          `牌桌手记备份-${todayFile()}.json`,
-          JSON.stringify(book, null, 2),
-          "application/json",
-        );
+        await saveBackup(true);
+        break;
+      case "backup-text":
+        await saveBackup(false);
         break;
       case "restore":
         if (native) {
           const data = await native.importFile();
-          if (data != null) openImport(data);
+          if (data != null) await openImport(data);
         } else $("#restore-file").click();
         break;
       case "merge": {
         if (!pendingImport) return;
-        const incoming = pendingImport;
-        await change((data) => merge(data, incoming));
+        const { book: incoming, photos } = pendingImport;
+        await change((data) => {
+          merge(data, incoming);
+          syncPhotoMeta(data, photos);
+        }, photos.size ? { save: [...photos.values()].map(({ restored, ...rec }) => rec) } : null);
+        sweepLater();
         close();
         move("players");
         toast("完整备份已合并");
@@ -1100,7 +1687,13 @@
       if (e.target.id === "restore-file") {
         const f = e.target.files[0];
         e.target.value = "";
-        if (f) openImport(await f.text());
+        if (f && f.size > MAX_BACKUP_BYTES) throw Error("备份文件超过 300 MB，无法在手机上安全读取。");
+        if (f) await openImport(await f.text());
+      }
+      if (e.target.id === "photo-file") {
+        const f = e.target.files[0];
+        e.target.value = "";
+        if (f) await addPhoto(f);
       }
     } catch (err) {
       showError(err);
@@ -1119,6 +1712,7 @@
     if (e.target.id === "note-search") {
       selState.noteQuery = e.target.value;
       $("#timeline-list").innerHTML = timelineList();
+      hydratePhotos($("#timeline-list"));
     }
   });
   function setupOffline() {
@@ -1180,6 +1774,7 @@
       ready = true;
       render();
       $("#quick-text").focus({ preventScroll: true });
+      if (!native) sweepLater();
     } catch (e) {
       root.innerHTML = `<div class="panel"><h1>无法打开本机存档</h1><p>${esc(e?.message || "请检查浏览器是否允许本地存储，并重新打开。")}</p></div>`;
       return;
@@ -1190,8 +1785,10 @@
         if (document.visibilityState === "visible" && !dialog.open) {
           try {
             book = await readDb();
-            if (selState.page === "notes" && $("#timeline-list")) $("#timeline-list").innerHTML = timelineList();
-            else render();
+            if (selState.page === "notes" && $("#timeline-list")) {
+              $("#timeline-list").innerHTML = timelineList();
+              hydratePhotos($("#timeline-list"));
+            } else render();
           } catch (e) {
             showError(e);
           }

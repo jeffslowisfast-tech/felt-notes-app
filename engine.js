@@ -96,6 +96,8 @@
             lines.push(...quoted(`${label}　${values.map(card => cardText(card) || "□").join(" ")}`));
           }
         }
+        // Photos stay on the device; the report only says one exists.
+        if (note.photo && typeof note.photo === "object") lines.push(...quoted("照片　1 张（只存本机，未随本文件导出）"));
         if (hasText(note.text)) lines.push("", "观察原文", "", ...quoted(note.text));
         if (hasText(note.reflection)) lines.push("", "我对这手的复盘", "", ...quoted(note.reflection));
         lines.push("");

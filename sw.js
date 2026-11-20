@@ -1,10 +1,10 @@
 // The release builder updates this revision when the shell changes.
-const REVISION = "af8b0ec712c4079f";
+const REVISION = "894c985b0784b9a3";
 const base = new URL(self.registration.scope);
 const prefix = "felt-notes-shell:" + base.pathname + ":";
 const currentCache = prefix + REVISION;
 const assets = [
-  "index.html", "style.css", "app.js", "engine.js", "manifest.webmanifest",
+  "index.html", "style.css", "app.js", "engine.js", "vision.js", "manifest.webmanifest",
   "icon-192.png", "icon-512.png", "apple-touch-icon.png"
 ];
 const assetUrls = assets.map(name => new URL(name, base).href);
