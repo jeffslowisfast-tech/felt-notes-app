@@ -1,0 +1,16 @@
+{
+  "id": "./",
+  "name": "牌桌手记 · Felt Notes",
+  "short_name": "牌桌手记",
+  "description": "本机保存的线下德扑牌手档案与复盘笔记",
+  "lang": "zh-Hans",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f7f5ec",
+  "theme_color": "#123e36",
+  "icons": [
+    { "src": "./icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
