@@ -1,5 +1,5 @@
 // The release builder updates this revision when the shell changes.
-const REVISION = "894c985b0784b9a3";
+const REVISION = "0d63e97f9b1ee445";
 const base = new URL(self.registration.scope);
 const prefix = "felt-notes-shell:" + base.pathname + ":";
 const currentCache = prefix + REVISION;

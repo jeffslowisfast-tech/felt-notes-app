@@ -733,6 +733,21 @@
   // bytes live in IndexedDB; only the small reference goes to localStorage.
   const newDraft = () => ({ id: uid(), text: "", target: "", at: now(), photo: null, board: [] });
   let draft = newDraft(), storedDraft = null, draftWarning = "";
+  // draftSlot changes whenever the composer starts holding a different draft
+  // (or the same draft is pointed at another player); photoSeq orders picks.
+  // A photo finishing late is attached only if both still match its start.
+  let draftSlot = 0, photoSeq = 0;
+  function replaceDraft(next, raw = null) {
+    draft = next;
+    storedDraft = raw;
+    recog = null;
+    draftSlot++;
+  }
+  // While a photo is being processed these would change which draft it belongs to.
+  const blockedWhileBusy = new Set([
+    "add-note", "resume-draft", "detach-draft", "remove-photo",
+    "board-scan", "board-accept", "board-edit", "board-dismiss",
+  ]);
   const hasDraft = (d) => !!(d.text || d.photo);
   function cleanBoard(list) {
     if (!Array.isArray(list) || list.length > 5) return [];
@@ -759,9 +774,7 @@
     return found.sort((a, b) => Date.parse(b.value.changed || b.value.at) - Date.parse(a.value.changed || a.value.at));
   }
   function loadDraft(item) {
-    draft = item.value;
-    storedDraft = item.raw;
-    recog = null;
+    replaceDraft(item.value, item.raw);
   }
   function writeDraft(text) {
     if (!hasDraft(draft) && text) draft.at = now();
@@ -785,11 +798,19 @@
   }
   function syncComposer() {
     const status = $("#draft-status"), save = $("#quick-save");
-    const picker = $("#photo-file");
-    if (picker) picker.disabled = photoBusy;
     if (status) status.textContent = draftWarning ||
       (photoBusy ? "正在处理照片…" : hasDraft(draft) ? "草稿已保存" : "");
     if (save) save.disabled = photoBusy || !(draft.text.trim() || draft.photo);
+    const picker = $("#photo-file");
+    if (picker) {
+      picker.disabled = photoBusy;
+      picker.closest(".photo-btn")?.setAttribute("aria-busy", String(photoBusy));
+    }
+    for (const b of document.querySelectorAll("#main [data-action]"))
+      if (blockedWhileBusy.has(b.dataset.action)) {
+        if (photoBusy) b.setAttribute("aria-disabled", "true");
+        else b.removeAttribute("aria-disabled");
+      }
   }
 
   /* ---------- photo in the composer ---------- */
@@ -841,7 +862,8 @@
     }
   }
   async function addPhoto(file) {
-    if (photoBusy) throw Error("正在保存上一张照片，请稍等。");
+    if (photoBusy) throw Error("上一张照片还在处理，请稍等。");
+    const slot = draftSlot, seq = ++photoSeq, owner = draft.target;
     photoBusy = true;
     syncComposer();
     let made;
@@ -856,6 +878,13 @@
       syncComposer();
     }
     const { record, canvas } = made;
+    if (slot !== draftSlot || seq !== photoSeq || owner !== draft.target) {
+      // The composer moved on while this photo was processed: never attach it elsewhere.
+      memPhotos.delete(record.id);
+      if (!native) idb("readwrite", (store) => { store.delete(photoKey(record.id)); }).catch(() => {});
+      toast("照片处理期间草稿已切换，这张照片没有附加。");
+      return;
+    }
     if (!hasDraft(draft)) draft.at = now();
     draft.photo = { id: record.id, type: record.type, width: record.width, height: record.height, size: record.size };
     draft.board = [];
@@ -972,10 +1001,8 @@
       if (localStorage.getItem(key) === written) localStorage.removeItem(key);
     } catch { /* The note was committed to the book. */ }
     if (draft.id === snapshot.id) {
-      draft = newDraft();
-      storedDraft = null;
+      replaceDraft(newDraft());
       draftWarning = "";
-      recog = null;
     }
     selState.noteQuery = "";
     render();
@@ -1015,6 +1042,7 @@
     else if (selState.page === "export") exportPage();
     else home();
     hydratePhotos(root);
+    syncComposer();
   }
   function show(title, body) {
     focusBefore = document.activeElement;
@@ -1459,10 +1487,8 @@
     }
   }
   async function handle(action, id, owner) {
-    if (photoBusy && ["add-note", "resume-draft", "detach-draft", "remove-photo", "board-edit", "board-accept", "board-scan"].includes(action)) {
-      toast("照片处理好后就可以切换或修改草稿。");
-      return;
-    }
+    if (photoBusy && blockedWhileBusy.has(action))
+      throw Error("照片还在处理，请稍等几秒再切换草稿或牌手。");
     switch (action) {
       case "nav":
         move(id);
@@ -1484,12 +1510,14 @@
         exploitForm(playerBy(id));
         break;
       case "add-note":
-        if (hasDraft(draft) && draft.target !== id) { draft = newDraft(); storedDraft = null; recog = null; }
+        if (hasDraft(draft) && draft.target !== id) replaceDraft(newDraft());
+        else if (draft.target !== (id || "")) draftSlot++;
         draft.target = id || "";
         move("notes");
         $("#quick-text").focus();
         break;
       case "detach-draft":
+        draftSlot++;
         draft.target = "";
         writeDraft(draft.text);
         render();
@@ -1508,6 +1536,7 @@
         break;
       }
       case "remove-photo":
+        photoSeq++;
         draft.photo = null;
         draft.board = [];
         recog = null;

@@ -2300,3 +2300,13 @@ dialog .photo-edit.dropped .photo-thumb {
     height: 52px;
   }
 }
+
+/* Photo processing: the picker and draft-switching controls rest until it finishes. */
+.notebook .photo-btn[aria-busy="true"] {
+  opacity: 0.45;
+  cursor: progress;
+}
+[data-action][aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: progress;
+}
